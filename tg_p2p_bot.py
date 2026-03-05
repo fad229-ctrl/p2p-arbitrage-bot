@@ -4,9 +4,19 @@ import threading
 import requests
 from typing import Dict, Any, List, Optional, Tuple
 
+# =========================
+# ENV VARS
+# =========================
 TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "").strip()  # например "123456789" или пусто
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()  # быстрый/дешевле
+AI_DEFAULT_ENABLED = os.getenv("AI_ENABLED", "0").strip() in ("1", "true", "True", "yes", "YES")
+
+# =========================
+# Binance P2P
+# =========================
 P2P_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 HEADERS = {
     "accept": "*/*",
@@ -17,11 +27,12 @@ HEADERS = {
 MIN_USER_TRADES = 200
 MIN_COMPLETION_RATE = 95.0
 
-POLL_SECONDS = 15
-ROWS = 20
 ASSET = "USDT"
 FIAT = "EUR"
 
+# =========================
+# Telegram API
+# =========================
 TG_API = "https://api.telegram.org/bot{}/{}"
 
 def tg_call(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -32,12 +43,94 @@ def tg_call(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     r.raise_for_status()
     return r.json()
 
-def tg_send(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
+def tg_send(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> int:
     payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    tg_call("sendMessage", payload)
+    resp = tg_call("sendMessage", payload)
+    try:
+        return int(resp["result"]["message_id"])
+    except Exception:
+        return 0
 
+def tg_edit(chat_id: int, message_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
+    if not message_id:
+        return
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "disable_web_page_preview": True}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    tg_call("editMessageText", payload)
+
+def tg_action(chat_id: int, action: str = "typing") -> None:
+    # action: typing, upload_photo, etc.
+    tg_call("sendChatAction", {"chat_id": chat_id, "action": action})
+
+# =========================
+# OpenAI helper (Responses API)
+# =========================
+OPENAI_URL = "https://api.openai.com/v1/responses"
+
+def openai_score(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Возвращает {"ok": bool, "score": float(0..1), "reason": str}
+    Если ключа нет или ошибка — возвращаем None (и тогда пропускаем AI-фильтр).
+    """
+    if not OPENAI_API_KEY:
+        return None
+
+    # Важно: короткий prompt, чтобы было дешево.
+    prompt = (
+        "Ты помощник для P2P-арбитража. Оцени вероятность, что круг BUY->SELL реально исполнить без срыва.\n"
+        "Верни ТОЛЬКО JSON вида: {\"ok\": true/false, \"score\": 0..1, \"reason\": \"...\"}\n"
+        "Учитывай: spread, лимиты, trades, completion, метод оплаты, сумма. "
+        "Если риск высокий (лимиты впритык/мало сделок/низкое завершение/слишком подозрительный спред) — ok=false.\n"
+        f"Данные: {signal}"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": OPENAI_MODEL,
+        "input": prompt,
+        # просим без “рассуждений” и минимально
+        "reasoning": {"effort": "none"},
+    }
+
+    r = requests.post(OPENAI_URL, headers=headers, json=body, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+
+    # В Responses API удобнее брать output_text
+    # Но здесь придет структура; берем output_text если есть
+    text = data.get("output_text")
+    if not text:
+        # fallback: попробуем вытащить из output[0].content[0].text
+        try:
+            text = data["output"][0]["content"][0]["text"]
+        except Exception:
+            return None
+
+    # Парсим JSON максимально безопасно
+    text = text.strip()
+    if not (text.startswith("{") and text.endswith("}")):
+        return None
+
+    try:
+        import json
+        obj = json.loads(text)
+        ok = bool(obj.get("ok"))
+        score = float(obj.get("score", 0.0))
+        reason = str(obj.get("reason", ""))[:300]
+        score = max(0.0, min(1.0, score))
+        return {"ok": ok, "score": score, "reason": reason}
+    except Exception:
+        return None
+
+# =========================
+# Utils
+# =========================
 def safe_float(x, default=None):
     try:
         return float(str(x).replace(",", "."))
@@ -56,14 +149,14 @@ def completion_to_percent(val) -> float:
         v *= 100.0
     return v
 
-def fetch_ads(trade_type: str, pay_types: List[str], rows: int = ROWS) -> Dict[str, Any]:
+def fetch_ads(trade_type: str, pay_types: List[str], rows: int) -> Dict[str, Any]:
     payload = {
         "page": 1,
         "rows": rows,
-        "payTypes": pay_types,
+        "payTypes": pay_types,   # [] => любые
         "asset": ASSET,
         "fiat": FIAT,
-        "tradeType": trade_type
+        "tradeType": trade_type  # "BUY" / "SELL"
     }
     r = requests.post(P2P_URL, headers=HEADERS, json=payload, timeout=15)
     r.raise_for_status()
@@ -73,28 +166,29 @@ def get_price(item: Dict[str, Any]) -> Optional[float]:
     adv = item.get("adv") or {}
     return safe_float(adv.get("price"), None)
 
-def passes_filters(item: Dict[str, Any], amount_fiat: float) -> bool:
+def get_limits(item: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
     adv = item.get("adv") or {}
-    advertiser = item.get("advertiser") or {}
+    return safe_float(adv.get("minSingleTransAmount"), None), safe_float(adv.get("maxSingleTransAmount"), None)
 
-    min_single = safe_float(adv.get("minSingleTransAmount"), None)
-    max_single = safe_float(adv.get("maxSingleTransAmount"), None)
-    if min_single is None or max_single is None:
-        return False
-    if not (min_single <= amount_fiat <= max_single):
-        return False
-
-    trades = advertiser.get("monthOrderCount") or advertiser.get("orderCount") or 0
+def get_adv_stats(item: Dict[str, Any]) -> Tuple[int, float]:
+    advr = item.get("advertiser") or {}
+    trades = advr.get("monthOrderCount") or advr.get("orderCount") or 0
     trades = safe_int(trades, 0)
-
-    completion = advertiser.get("monthFinishRate") or advertiser.get("finishRate") or 0
+    completion = advr.get("monthFinishRate") or advr.get("finishRate") or 0
     completion = completion_to_percent(completion)
+    return trades, completion
 
+def passes_filters(item: Dict[str, Any], amount_fiat: float) -> bool:
+    mn, mx = get_limits(item)
+    if mn is None or mx is None:
+        return False
+    if not (mn <= amount_fiat <= mx):
+        return False
+    trades, completion = get_adv_stats(item)
     if trades < MIN_USER_TRADES:
         return False
     if completion < MIN_COMPLETION_RATE:
         return False
-
     return True
 
 def pct(buy_price: float, sell_price: float) -> float:
@@ -131,22 +225,29 @@ def recommend_threshold(balance: float) -> float:
         return 1.5
     return 1.2
 
-STATE = {
-    "chat_id": None,
-    "balance": 100.0,
-    "pay_types": ["SEPA"],  # [] means ANY
-    "running": False,
-    "threshold": 1.9
-}
-
-_stop_event = threading.Event()
-_worker_thread: Optional[threading.Thread] = None
-_last_signal_key = None
-
-def is_allowed(chat_id: int) -> bool:
-    if not ALLOWED_CHAT_ID:
-        return True
-    return str(chat_id) == ALLOWED_CHAT_ID
+# =========================
+# UI (Buttons)
+# =========================
+def main_menu() -> Dict[str, Any]:
+    pay = "ANY" if not STATE["pay_types"] else STATE["pay_types"][0]
+    ai = "ON" if STATE["ai_enabled"] else "OFF"
+    spd = f"{STATE['poll_seconds']}s"
+    return {
+        "inline_keyboard": [
+            [
+                {"text": f"💳 Оплата: {pay}", "callback_data": "MENU:PAY"},
+                {"text": f"🤖 AI: {ai}", "callback_data": "MENU:AI"},
+            ],
+            [
+                {"text": f"⏱ Скорость: {spd}", "callback_data": "MENU:SPEED"},
+                {"text": "📌 Статус", "callback_data": "MENU:STATUS"},
+            ],
+            [
+                {"text": "▶️ Старт", "callback_data": "MENU:RUN"},
+                {"text": "⏸ Стоп", "callback_data": "MENU:STOP"},
+            ],
+        ]
+    }
 
 def pay_buttons() -> Dict[str, Any]:
     return {
@@ -155,28 +256,95 @@ def pay_buttons() -> Dict[str, Any]:
             {"text": "Revolut", "callback_data": "PAY:Revolut"},
             {"text": "Wise", "callback_data": "PAY:Wise"},
             {"text": "Любые", "callback_data": "PAY:ANY"},
+        ], [
+            {"text": "⬅️ Назад", "callback_data": "BACK:MENU"}
         ]]
     }
 
+def speed_buttons() -> Dict[str, Any]:
+    return {
+        "inline_keyboard": [[
+            {"text": "5s", "callback_data": "SPD:5"},
+            {"text": "10s", "callback_data": "SPD:10"},
+            {"text": "15s", "callback_data": "SPD:15"},
+            {"text": "30s", "callback_data": "SPD:30"},
+        ], [
+            {"text": "⬅️ Назад", "callback_data": "BACK:MENU"}
+        ]]
+    }
+
+# =========================
+# Bot state + worker
+# =========================
+STATE = {
+    "chat_id": None,
+    "balance": 100.0,
+    "pay_types": ["SEPA"],   # [] means ANY
+    "running": False,
+    "threshold": 1.9,
+    "poll_seconds": 15,
+    "rows": 20,
+    "ai_enabled": AI_DEFAULT_ENABLED,
+    "scan_msg_id": 0,
+}
+
+_stop_event = threading.Event()
+_worker_thread: Optional[threading.Thread] = None
+_last_signal_key = None
+_spinner = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+
+def is_allowed(chat_id: int) -> bool:
+    if not ALLOWED_CHAT_ID:
+        return True
+    return str(chat_id) == ALLOWED_CHAT_ID
+
+def status_text() -> str:
+    return (
+        "📌 Статус\n"
+        f"running: {STATE['running']}\n"
+        f"balance: {STATE['balance']} {FIAT}\n"
+        f"payTypes: {'ANY' if not STATE['pay_types'] else ','.join(STATE['pay_types'])}\n"
+        f"threshold: {STATE['threshold']:.1f}%\n"
+        f"speed: {STATE['poll_seconds']}s | rows: {STATE['rows']}\n"
+        f"AI: {'ON' if STATE['ai_enabled'] else 'OFF'}\n"
+        f"filters: trades>={MIN_USER_TRADES}, completion>={MIN_COMPLETION_RATE}%"
+    )
+
 def scanner_loop():
     global _last_signal_key
+    spin_i = 0
+    last_edit = 0.0
+
     while not _stop_event.is_set():
         try:
             chat_id = STATE["chat_id"]
             balance = float(STATE["balance"])
             pay_types = list(STATE["pay_types"])
             threshold = float(STATE["threshold"])
+            poll = int(STATE["poll_seconds"])
+            rows = int(STATE["rows"])
 
-            buy_data = fetch_ads("BUY", pay_types, rows=ROWS)
-            sell_data = fetch_ads("SELL", pay_types, rows=ROWS)
+            # "анимация" — typing + обновляем сообщение раз в ~3 сек
+            tg_action(chat_id, "typing")
+            now = time.time()
+            if STATE["scan_msg_id"] and (now - last_edit) > 3:
+                icon = _spinner[spin_i % len(_spinner)]
+                spin_i += 1
+                tg_edit(chat_id, STATE["scan_msg_id"],
+                        f"🔎 Сканирую P2P… {icon}\n"
+                        f"Оплата: {'ANY' if not pay_types else pay_types[0]} | Баланс: {balance:.2f} {FIAT}\n"
+                        f"Порог: {threshold:.1f}% | Скорость: {poll}s | AI: {'ON' if STATE['ai_enabled'] else 'OFF'}",
+                        reply_markup=main_menu())
+                last_edit = now
 
+            buy_data = fetch_ads("BUY", pay_types, rows=rows)
+            sell_data = fetch_ads("SELL", pay_types, rows=rows)
             buys = buy_data.get("data") or []
             sells = sell_data.get("data") or []
 
             pair = best_pair(buys, sells, balance)
             if not pair:
-                tg_send(chat_id, "Нет подходящих связок под лимиты/фильтры. Ждём…")
-                time.sleep(POLL_SECONDS)
+                time.sleep(poll)
                 continue
 
             spread, b, s = pair
@@ -188,23 +356,59 @@ def scanner_loop():
 
             key = (round(bp or 0, 6), round(sp or 0, 6), round(spread, 4))
 
-            msg = (
-                f"BUY {bp:.4f} ({b_name}) -> SELL {sp:.4f} ({s_name})\n"
-                f"spread={spread:.2f}% | amount={balance:.2f} {FIAT}\n"
-                f"payTypes={'ANY' if not pay_types else ','.join(pay_types)} | threshold>={threshold:.1f}%"
-            )
-
             if spread >= threshold and key != _last_signal_key:
                 b_adv = b.get("adv") or {}
                 s_adv = s.get("adv") or {}
-                limits = (
+                b_mn, b_mx = get_limits(b)
+                s_mn, s_mx = get_limits(s)
+                b_tr, b_comp = get_adv_stats(b)
+                s_tr, s_comp = get_adv_stats(s)
+
+                signal = {
+                    "fiat": FIAT,
+                    "asset": ASSET,
+                    "amount": balance,
+                    "payType": ("ANY" if not pay_types else pay_types[0]),
+                    "spread_percent": round(spread, 4),
+                    "buy_price": bp,
+                    "sell_price": sp,
+                    "buy_limits": [b_mn, b_mx],
+                    "sell_limits": [s_mn, s_mx],
+                    "buy_trades": b_tr,
+                    "buy_completion": b_comp,
+                    "sell_trades": s_tr,
+                    "sell_completion": s_comp,
+                }
+
+                ai_note = ""
+                if STATE["ai_enabled"]:
+                    # AI запускаем только на кандидате, чтобы не было дорого
+                    ai = openai_score(signal)
+                    if ai is not None:
+                        if not ai["ok"]:
+                            # отсеяли
+                            ai_note = f"\n🤖 AI: SKIP (score={ai['score']:.2f}) — {ai['reason']}"
+                            _last_signal_key = key  # чтобы не спамить тем же
+                            # покажем короткое уведомление (без спама)
+                            tg_send(chat_id, "⚠️ Кандидат найден, но AI отсеял как рискованный." + ai_note)
+                            time.sleep(poll)
+                            continue
+                        else:
+                            ai_note = f"\n🤖 AI: OK (score={ai['score']:.2f}) — {ai['reason']}"
+
+                msg = (
+                    "🔥 SIGNAL\n"
+                    f"BUY {bp:.4f} ({b_name}) -> SELL {sp:.4f} ({s_name})\n"
+                    f"spread={spread:.2f}% | amount={balance:.2f} {FIAT}\n"
+                    f"payTypes={'ANY' if not pay_types else ','.join(pay_types)} | threshold>={threshold:.1f}%\n"
                     f"BUY limits : {b_adv.get('minSingleTransAmount')}..{b_adv.get('maxSingleTransAmount')} {FIAT}\n"
                     f"SELL limits: {s_adv.get('minSingleTransAmount')}..{s_adv.get('maxSingleTransAmount')} {FIAT}"
+                    + ai_note
                 )
-                tg_send(chat_id, "🔥 SIGNAL\n" + msg + "\n" + limits)
+                tg_send(chat_id, msg)
                 _last_signal_key = key
 
-            time.sleep(POLL_SECONDS)
+            time.sleep(poll)
 
         except Exception as e:
             try:
@@ -212,90 +416,99 @@ def scanner_loop():
                     tg_send(STATE["chat_id"], f"Ошибка: {repr(e)}")
             except Exception:
                 pass
-            time.sleep(max(10, POLL_SECONDS))
+            time.sleep(max(5, int(STATE["poll_seconds"])))
 
 def start_scanner(chat_id: int):
     global _worker_thread
     if STATE["running"]:
-        tg_send(chat_id, "Уже запущено. /status")
+        tg_send(chat_id, "Уже запущено.", reply_markup=main_menu())
         return
     STATE["running"] = True
     _stop_event.clear()
+    # создаём/обновляем “сканирую…” сообщение
+    STATE["scan_msg_id"] = tg_send(chat_id, "🔎 Сканирую P2P…", reply_markup=main_menu())
     _worker_thread = threading.Thread(target=scanner_loop, daemon=True)
     _worker_thread.start()
-    tg_send(chat_id, "✅ Сканер запущен. Я буду присылать SIGNAL, когда найду спред выше порога.")
 
 def stop_scanner(chat_id: int):
     if not STATE["running"]:
-        tg_send(chat_id, "Уже остановлено. /status")
+        tg_send(chat_id, "Уже остановлено.", reply_markup=main_menu())
         return
     STATE["running"] = False
     _stop_event.set()
-    tg_send(chat_id, "🛑 Остановлено.")
-
-def status(chat_id: int):
-    tg_send(
-        chat_id,
-        "📌 Статус\n"
-        f"running: {STATE['running']}\n"
-        f"balance: {STATE['balance']} {FIAT}\n"
-        f"payTypes: {'ANY' if not STATE['pay_types'] else ','.join(STATE['pay_types'])}\n"
-        f"threshold: {STATE['threshold']:.1f}%\n"
-        f"filters: trades>={MIN_USER_TRADES}, completion>={MIN_COMPLETION_RATE}%"
-    )
+    tg_send(chat_id, "⏸ Остановлено.", reply_markup=main_menu())
 
 def handle_message(chat_id: int, text: str):
     if text.startswith("/start"):
         STATE["chat_id"] = chat_id
         tg_send(
             chat_id,
-            "Привет! Я P2P-сканер.\n"
-            "1) /config — выбрать оплату кнопкой\n"
-            "2) Напиши: balance 250\n"
-            "3) /run — старт, /stop — стоп\n"
-            "4) /status — статус"
+            "Привет! 👋\n"
+            "1) Введи баланс сообщением:  balance 250\n"
+            "2) Дальше всё кнопками 👇",
+            reply_markup=main_menu()
         )
         return
 
-    if text.startswith("/config"):
-        tg_send(chat_id, "Выбери метод оплаты:", reply_markup=pay_buttons())
-        return
-
-    if text.startswith("/run"):
-        STATE["chat_id"] = chat_id
-        start_scanner(chat_id)
-        return
-
-    if text.startswith("/stop"):
-        stop_scanner(chat_id)
-        return
-
-    if text.startswith("/status"):
-        status(chat_id)
-        return
-
+    # Баланс — только вручную, как ты хотел
     if text.lower().startswith("balance"):
         parts = text.split()
         if len(parts) >= 2:
             v = safe_float(parts[1], None)
             if v is None or v <= 0:
-                tg_send(chat_id, "Баланс должен быть числом > 0. Пример: balance 200")
+                tg_send(chat_id, "Баланс должен быть числом > 0. Пример: balance 200", reply_markup=main_menu())
                 return
             STATE["balance"] = float(v)
             STATE["threshold"] = recommend_threshold(float(v))
-            tg_send(chat_id, f"✅ Баланс установлен: {v:.2f} {FIAT}\nПорог (бот выбрал): {STATE['threshold']:.1f}%")
+            tg_send(chat_id, f"✅ Баланс: {v:.2f} {FIAT}\nПорог (бот выбрал): {STATE['threshold']:.1f}%", reply_markup=main_menu())
             return
-        tg_send(chat_id, "Пример: balance 200")
+        tg_send(chat_id, "Пример: balance 200", reply_markup=main_menu())
         return
 
-    tg_send(chat_id, "Не понял. Команды: /config /run /stop /status или: balance 200")
+    tg_send(chat_id, "Используй кнопки меню или напиши: balance 200", reply_markup=main_menu())
 
 def handle_callback(chat_id: int, data: str):
+    # Главное меню
+    if data == "MENU:PAY":
+        tg_send(chat_id, "Выбери метод оплаты:", reply_markup=pay_buttons())
+        return
+    if data == "MENU:SPEED":
+        tg_send(chat_id, "Выбери скорость сканирования:", reply_markup=speed_buttons())
+        return
+    if data == "MENU:STATUS":
+        tg_send(chat_id, status_text(), reply_markup=main_menu())
+        return
+    if data == "MENU:RUN":
+        STATE["chat_id"] = chat_id
+        start_scanner(chat_id)
+        return
+    if data == "MENU:STOP":
+        stop_scanner(chat_id)
+        return
+    if data == "MENU:AI":
+        STATE["ai_enabled"] = not STATE["ai_enabled"]
+        tg_send(chat_id, f"🤖 AI теперь: {'ON' if STATE['ai_enabled'] else 'OFF'}", reply_markup=main_menu())
+        return
+
+    # Назад
+    if data == "BACK:MENU":
+        tg_send(chat_id, "Меню:", reply_markup=main_menu())
+        return
+
+    # Оплата
     if data.startswith("PAY:"):
         val = data.split(":", 1)[1]
         STATE["pay_types"] = [] if val == "ANY" else [val]
-        tg_send(chat_id, f"✅ Метод оплаты: {'ANY' if not STATE['pay_types'] else STATE['pay_types'][0]}")
-        status(chat_id)
+        tg_send(chat_id, f"✅ Оплата: {'ANY' if not STATE['pay_types'] else STATE['pay_types'][0]}", reply_markup=main_menu())
+        return
+
+    # Скорость
+    if data.startswith("SPD:"):
+        sec = safe_int(data.split(":", 1)[1], 15)
+        sec = max(5, min(60, sec))
+        STATE["poll_seconds"] = sec
+        tg_send(chat_id, f"✅ Скорость: {sec}s", reply_markup=main_menu())
+        return
 
 def main():
     if not TG_TOKEN:
