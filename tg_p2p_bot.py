@@ -27,13 +27,16 @@ HEADERS = {
 ASSET = "USDT"
 FIAT = "EUR"
 
-# Фильтры (мягкие, чтобы было больше вариантов)
+# Мягкие фильтры (чтобы были сигналы чаще)
 MIN_USER_TRADES = 50
 MIN_COMPLETION_RATE = 90.0
 
-# Глубина рынка
-DEFAULT_ROWS = 100     # сколько объявлений на страницу
-DEFAULT_PAGES = 5      # сколько страниц (rows*pages = до 500 объявлений)
+# Глубина рынка (можно менять кнопками позже, но тут дефолт)
+DEFAULT_ROWS = 100
+DEFAULT_PAGES = 5
+
+# Ускорение (топ кандидаты вместо полного BUY×SELL)
+CANDIDATES_K = 30  # 30x30=900 сравнений
 
 # =========================
 # Telegram API
@@ -70,7 +73,7 @@ def tg_edit(chat_id: int, message_id: int, text: str, reply_markup: Optional[Dic
     try:
         tg_call("editMessageText", payload)
     except Exception:
-        # Telegram иногда не даёт слишком часто редактировать / тот же текст
+        # Telegram иногда ругается на слишком частое редактирование/тот же текст
         pass
 
 
@@ -98,8 +101,7 @@ def openai_score(signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     prompt = (
         "Ты помощник для P2P-арбитража. Оцени вероятность, что круг BUY->SELL реально исполнить без срыва.\n"
         "Верни ТОЛЬКО JSON: {\"ok\": true/false, \"score\": 0..1, \"reason\": \"...\"}\n"
-        "Учитывай: spread, лимиты, trades, completion, метод оплаты, сумма. "
-        "Если риск высокий — ok=false.\n"
+        "Учитывай: spread, лимиты, trades, completion, метод оплаты, сумма.\n"
         f"Данные: {signal}"
     )
 
@@ -176,7 +178,7 @@ def fetch_multi_pages(trade_type: str, pay_types: List[str], rows: int, pages: i
     for p in range(1, pages + 1):
         data = fetch_ads(trade_type, pay_types, rows=rows, page=p)
         out.extend(data.get("data") or [])
-        time.sleep(0.2)  # чтобы не долбить Binance
+        time.sleep(0.15)  # чтобы не долбить Binance
     return out
 
 
@@ -205,6 +207,7 @@ def passes_filters(item: Dict[str, Any], amount_fiat: float) -> bool:
         return False
     if not (mn <= amount_fiat <= mx):
         return False
+
     trades, completion = get_adv_stats(item)
     if trades < MIN_USER_TRADES:
         return False
@@ -217,7 +220,32 @@ def pct(buy_price: float, sell_price: float) -> float:
     return (sell_price - buy_price) / buy_price * 100.0
 
 
-def top_pairs_in_range(
+def profit_eur(amount_fiat: float, spread_percent: float) -> float:
+    return amount_fiat * (spread_percent / 100.0)
+
+
+def select_candidates(
+    buys: List[Dict[str, Any]],
+    sells: List[Dict[str, Any]],
+    amount_fiat: float,
+    k: int = CANDIDATES_K
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Ускорение:
+    - BUY выгоднее по минимальной цене
+    - SELL выгоднее по максимальной цене
+    Берём только топ-k кандидатов после фильтров.
+    """
+    buy_ok = [b for b in buys if passes_filters(b, amount_fiat) and get_price(b) is not None]
+    sell_ok = [s for s in sells if passes_filters(s, amount_fiat) and get_price(s) is not None]
+
+    buy_ok.sort(key=lambda x: get_price(x) or 10**9)     # дешевле -> лучше
+    sell_ok.sort(key=lambda x: get_price(x) or -10**9, reverse=True)  # дороже -> лучше
+
+    return buy_ok[:k], sell_ok[:k]
+
+
+def top_pairs_in_range_fast(
     buys: List[Dict[str, Any]],
     sells: List[Dict[str, Any]],
     amount_fiat: float,
@@ -225,15 +253,14 @@ def top_pairs_in_range(
     spread_max: float,
     n: int = 5
 ) -> List[Tuple[float, Dict[str, Any], Dict[str, Any]]]:
-    buy_ok = [b for b in buys if passes_filters(b, amount_fiat)]
-    sell_ok = [s for s in sells if passes_filters(s, amount_fiat)]
+    buy_c, sell_c = select_candidates(buys, sells, amount_fiat, k=CANDIDATES_K)
 
     pairs: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
-    for b in buy_ok:
+    for b in buy_c:
         bp = get_price(b)
         if bp is None:
             continue
-        for s in sell_ok:
+        for s in sell_c:
             sp = get_price(s)
             if sp is None:
                 continue
@@ -246,7 +273,7 @@ def top_pairs_in_range(
 
 
 # =========================
-# State
+# State (шаги + сохранение)
 # =========================
 DEFAULT_STATE: Dict[str, Any] = {
     "chat_id": None,
@@ -255,18 +282,18 @@ DEFAULT_STATE: Dict[str, Any] = {
     "balance": 0.0,
     "balance_set": False,
 
-    "pay_types": [],  # [] = ANY
+    "pay_types": [],      # [] = ANY
     "pay_set": False,
 
-    # стратегия: диапазон сделок и порог сигнала
-    "spread_min": 0.2,
-    "spread_max": 1.3,
+    # стратегия
+    "spread_min": 0.0,    # чтобы чаще видеть рынок
+    "spread_max": 1.2,
     "range_set": False,
 
-    "alert_spread": 1.0,
+    "alert_spread": 0.3,  # порог сигнала
     "alert_set": False,
 
-    "poll_seconds": 15,
+    "poll_seconds": 5,    # скорость
     "speed_set": False,
 
     "rows": DEFAULT_ROWS,
@@ -278,7 +305,7 @@ DEFAULT_STATE: Dict[str, Any] = {
     "running": False,
     "scan_msg_id": 0,
 
-    # мастер-настройка: 0=нет, 1..4
+    # wizard step: 0=нет, 1=pay, 2=range, 3=alert, 4=speed, 5=ready
     "wizard_step": 0,
 }
 
@@ -291,34 +318,44 @@ _last_signal_key = None
 _spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 
-def reset_all(chat_id: int):
-    global _last_signal_key
-    stop_scanner(chat_id, silent=True)
-
-    for k in list(STATE.keys()):
-        STATE.pop(k, None)
-
-    STATE.update(dict(DEFAULT_STATE))
-    STATE["chat_id"] = chat_id
-    _last_signal_key = None
-
-    tg_send(chat_id, "🔄 Сбросил настройки. Введи баланс: balance 250", reply_markup=main_menu())
-
-
 def is_allowed(chat_id: int) -> bool:
     if not ALLOWED_CHAT_ID:
         return True
     return str(chat_id) == ALLOWED_CHAT_ID
 
 
-# =========================
-# UI (кнопки как у тебя)
-# =========================
 def pay_label() -> str:
     return "ANY" if not STATE["pay_types"] else STATE["pay_types"][0]
 
 
-def main_menu() -> Dict[str, Any]:
+def reset_all(chat_id: int):
+    global _last_signal_key
+    stop_scanner(chat_id, silent=True)
+
+    STATE.clear()
+    STATE.update(dict(DEFAULT_STATE))
+    STATE["chat_id"] = chat_id
+    _last_signal_key = None
+
+    tg_send(chat_id, "🔄 Сбросил настройки.\nВведи баланс сообщением: balance 200", reply_markup=kb_start())
+
+
+# =========================
+# UI (ПОШАГОВО)
+# =========================
+def kb_start() -> Dict[str, Any]:
+    # минимальная панель на старте
+    return {
+        "inline_keyboard": [
+            [{"text": "⚙️ Настроить", "callback_data": "WIZ:START"}],
+            [{"text": "📖 Инструкция", "callback_data": "MENU:HELP"}],
+            [{"text": "🔄 Сброс", "callback_data": "MENU:RESET"}],
+        ]
+    }
+
+
+def kb_main() -> Dict[str, Any]:
+    # полноценная панель только ПОСЛЕ настройки
     pay = pay_label()
     ai = "ON" if STATE["ai_enabled"] else "OFF"
     spd = f"{STATE['poll_seconds']}s"
@@ -337,16 +374,25 @@ def main_menu() -> Dict[str, Any]:
             ],
             [
                 {"text": "🧾 ТОП-5", "callback_data": "MENU:TOP5"},
+                {"text": "📌 Статус", "callback_data": "MENU:STATUS"},
                 {"text": "📖 Инструкция", "callback_data": "MENU:HELP"},
             ],
             [
-                {"text": "⚙️ Настроить и старт", "callback_data": "WIZ:START"},
                 {"text": "🔄 Сброс", "callback_data": "MENU:RESET"},
             ],
             [
                 {"text": "▶️ Старт", "callback_data": "MENU:RUN"},
                 {"text": "⏸ Стоп", "callback_data": "MENU:STOP"},
             ],
+        ]
+    }
+
+
+def kb_back_reset() -> Dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": "⬅️ Назад", "callback_data": "BACK:WIZ"}],
+            [{"text": "🔄 Сброс", "callback_data": "MENU:RESET"}],
         ]
     }
 
@@ -360,7 +406,41 @@ def pay_buttons() -> Dict[str, Any]:
                 {"text": "Wise", "callback_data": "PAY:Wise"},
                 {"text": "ANY", "callback_data": "PAY:ANY"},
             ],
-            [{"text": "⬅️ Назад", "callback_data": "BACK:MENU"}],
+            [{"text": "🔄 Сброс", "callback_data": "MENU:RESET"}],
+        ]
+    }
+
+
+def range_buttons() -> Dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "0.0–1.2%", "callback_data": "RNG:0.0:1.2"},
+                {"text": "0.2–1.3%", "callback_data": "RNG:0.2:1.3"},
+            ],
+            [
+                {"text": "0.2–0.8%", "callback_data": "RNG:0.2:0.8"},
+                {"text": "0.3–1.5%", "callback_data": "RNG:0.3:1.5"},
+            ],
+            [{"text": "🔄 Сброс", "callback_data": "MENU:RESET"}],
+        ]
+    }
+
+
+def alert_buttons() -> Dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "0.2%", "callback_data": "ALERT:0.2"},
+                {"text": "0.3%", "callback_data": "ALERT:0.3"},
+                {"text": "0.4%", "callback_data": "ALERT:0.4"},
+            ],
+            [
+                {"text": "0.5%", "callback_data": "ALERT:0.5"},
+                {"text": "0.8%", "callback_data": "ALERT:0.8"},
+                {"text": "1.0%", "callback_data": "ALERT:1.0"},
+            ],
+            [{"text": "🔄 Сброс", "callback_data": "MENU:RESET"}],
         ]
     }
 
@@ -374,37 +454,7 @@ def speed_buttons() -> Dict[str, Any]:
                 {"text": "15s", "callback_data": "SPD:15"},
                 {"text": "30s", "callback_data": "SPD:30"},
             ],
-            [{"text": "⬅️ Назад", "callback_data": "BACK:MENU"}],
-        ]
-    }
-
-
-def range_buttons() -> Dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "0.2–1.3%", "callback_data": "RNG:0.2:1.3"},
-                {"text": "0.3–1.5%", "callback_data": "RNG:0.3:1.5"},
-            ],
-            [
-                {"text": "0.5–2.0%", "callback_data": "RNG:0.5:2.0"},
-                {"text": "0.2–0.8%", "callback_data": "RNG:0.2:0.8"},
-            ],
-            [{"text": "⬅️ Назад", "callback_data": "BACK:MENU"}],
-        ]
-    }
-
-
-def alert_buttons() -> Dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "0.8%", "callback_data": "ALERT:0.8"},
-                {"text": "1.0%", "callback_data": "ALERT:1.0"},
-                {"text": "1.2%", "callback_data": "ALERT:1.2"},
-                {"text": "1.5%", "callback_data": "ALERT:1.5"},
-            ],
-            [{"text": "⬅️ Назад", "callback_data": "BACK:MENU"}],
+            [{"text": "🔄 Сброс", "callback_data": "MENU:RESET"}],
         ]
     }
 
@@ -412,18 +462,16 @@ def alert_buttons() -> Dict[str, Any]:
 def help_text() -> str:
     return (
         "📖 Инструкция\n\n"
-        "1) /start\n"
-        "2) Введи баланс сообщением: balance 250\n\n"
-        "Дальше можно:\n"
-        "• Настроить вручную кнопками\n"
-        "• Или пройти пошагово через «⚙️ Настроить и старт»\n\n"
-        "Кнопки:\n"
-        "• 💳 Оплата — метод оплаты\n"
-        "• 📈 Диапазон — какие спреды вообще искать (например 0.2–1.3%)\n"
+        "1) Напиши баланс: balance 200\n"
+        "2) Нажми «⚙️ Настроить» и выбери настройки по шагам\n"
+        "3) Нажми ▶️ Старт\n\n"
+        "Пояснения:\n"
+        "• 📈 Диапазон — какие спреды вообще показывать/искать\n"
         "• ⚡ Порог — от какого спреда присылать 🔥 SIGNAL\n"
-        "• ⏱ Скорость — как часто сканировать\n"
-        "• 🧾 ТОП-5 — 5 лучших связок прямо сейчас (в диапазоне)\n"
-        "• 🔄 Сброс — сброс настроек\n"
+        "• 🧾 ТОП-5 — 5 лучших связок прямо сейчас (в диапазоне)\n\n"
+        "Важно:\n"
+        "• Не принимай оплату от третьих лиц.\n"
+        "• Не пиши 'crypto/binance' в комментарии перевода.\n"
     )
 
 
@@ -443,63 +491,81 @@ def status_text() -> str:
 
 
 # =========================
-# Preflight + Wizard
+# Wizard (пошагово)
 # =========================
-def preflight(chat_id: int) -> bool:
-    if not STATE["balance_set"]:
-        tg_send(chat_id, "Сначала введи баланс: balance 250", reply_markup=main_menu())
-        return False
-    if not STATE["pay_set"]:
-        tg_send(chat_id, "Сначала выбери оплату 💳", reply_markup=pay_buttons())
-        return False
-    if not STATE["range_set"]:
-        tg_send(chat_id, "Сначала выбери диапазон 📈", reply_markup=range_buttons())
-        return False
-    if not STATE["alert_set"]:
-        tg_send(chat_id, "Сначала выбери порог ⚡", reply_markup=alert_buttons())
-        return False
-    if not STATE["speed_set"]:
-        tg_send(chat_id, "Сначала выбери скорость ⏱", reply_markup=speed_buttons())
-        return False
-    return True
-
-
 def wizard_start(chat_id: int):
-    STATE["wizard_step"] = 1
+    STATE["chat_id"] = chat_id
 
     if not STATE["balance_set"]:
+        STATE["wizard_step"] = 0
         tg_send(
             chat_id,
-            "Шаг 0/4: введи баланс сообщением: balance 250\n"
-            "После этого снова нажми «⚙️ Настроить и старт».",
-            reply_markup=main_menu()
+            "Шаг 0/4\nВведи баланс сообщением, например:\nbalance 200",
+            reply_markup=kb_start()
         )
         return
 
-    tg_send(chat_id, "Шаг 1/4: выбери оплату 💳", reply_markup=pay_buttons())
+    STATE["wizard_step"] = 1
+    tg_send(chat_id, "Шаг 1/4 — выбери оплату 💳", reply_markup=pay_buttons())
+
+
+def wizard_go_step(chat_id: int):
+    step = int(STATE.get("wizard_step") or 0)
+
+    if step <= 0:
+        wizard_start(chat_id)
+        return
+
+    if step == 1:
+        tg_send(chat_id, "Шаг 1/4 — выбери оплату 💳", reply_markup=pay_buttons())
+        return
+
+    if step == 2:
+        tg_send(chat_id, "Шаг 2/4 — выбери диапазон 📈", reply_markup=range_buttons())
+        return
+
+    if step == 3:
+        tg_send(chat_id, "Шаг 3/4 — выбери порог ⚡", reply_markup=alert_buttons())
+        return
+
+    if step == 4:
+        tg_send(chat_id, "Шаг 4/4 — выбери скорость ⏱", reply_markup=speed_buttons())
+        return
+
+    if step >= 5:
+        tg_send(chat_id, "✅ Готово! Жми ▶️ Старт или 🧾 ТОП-5.", reply_markup=kb_main())
 
 
 def wizard_next(chat_id: int):
     step = int(STATE.get("wizard_step") or 0)
-    if step == 1:
-        STATE["wizard_step"] = 2
-        tg_send(chat_id, "Шаг 2/4: выбери диапазон 📈", reply_markup=range_buttons())
-        return
+    step += 1
+    STATE["wizard_step"] = step
+
     if step == 2:
-        STATE["wizard_step"] = 3
-        tg_send(chat_id, "Шаг 3/4: выбери порог ⚡", reply_markup=alert_buttons())
+        tg_send(chat_id, "Шаг 2/4 — выбери диапазон 📈", reply_markup=range_buttons())
         return
     if step == 3:
-        STATE["wizard_step"] = 4
-        tg_send(chat_id, "Шаг 4/4: выбери скорость ⏱", reply_markup=speed_buttons())
+        tg_send(chat_id, "Шаг 3/4 — выбери порог ⚡", reply_markup=alert_buttons())
         return
     if step == 4:
-        STATE["wizard_step"] = 0
-        tg_send(chat_id, "✅ Готово! Теперь жми ▶️ Старт или 🧾 ТОП-5.", reply_markup=main_menu())
+        tg_send(chat_id, "Шаг 4/4 — выбери скорость ⏱", reply_markup=speed_buttons())
+        return
+    if step >= 5:
+        tg_send(chat_id, "✅ Настройка завершена. Жми ▶️ Старт.", reply_markup=kb_main())
+
+
+def preflight(chat_id: int) -> bool:
+    if not STATE["balance_set"]:
+        tg_send(chat_id, "Сначала введи баланс: balance 200", reply_markup=kb_start())
+        return False
+    if not STATE["pay_set"] or not STATE["range_set"] or not STATE["alert_set"] or not STATE["speed_set"]:
+        tg_send(chat_id, "Сначала пройди настройку: ⚙️ Настроить", reply_markup=kb_start())
+        return False
+    return True
 
 
 # =========================
-# Scanner
+# Scanner loop
 # =========================
 def scanner_loop():
     global _last_signal_key
@@ -525,33 +591,41 @@ def scanner_loop():
             buys = fetch_multi_pages("BUY", pay_types, rows=rows, pages=pages)
             sells = fetch_multi_pages("SELL", pay_types, rows=rows, pages=pages)
 
-            top5 = top_pairs_in_range(buys, sells, balance, spread_min, spread_max, n=5)
+            top5 = top_pairs_in_range_fast(buys, sells, balance, spread_min, spread_max, n=5)
             best_now = top5[0][0] if top5 else None
 
             now = time.time()
             if STATE["scan_msg_id"] and (now - last_edit) > 3:
                 icon = _spinner[spin_i % len(_spinner)]
                 spin_i += 1
-                best_line = f"Лучший сейчас: {best_now:.2f}%" if best_now is not None else "Лучший сейчас: —"
+
+                if best_now is None:
+                    best_line = "Лучший сейчас: — (в твоём диапазоне)"
+                else:
+                    best_line = f"Лучший сейчас: {best_now:.2f}% (~{profit_eur(balance, best_now):.2f}€)"
+
                 tg_edit(
                     chat_id,
                     STATE["scan_msg_id"],
-                    f"🔎 Сканирую… {icon}\n"
-                    f"{best_line}\n"
-                    f"Оплата: {pay_label()} | Баланс: {balance:.2f} {FIAT}\n"
-                    f"Диапазон: {spread_min:.1f}–{spread_max:.1f}% | Порог: {alert:.1f}% | Скорость: {poll}s\n"
-                    f"AI: {'ON' if STATE['ai_enabled'] else 'OFF'}",
-                    reply_markup=main_menu()
+                    "🔎 Ищу связки на P2P… {}\n{}\n"
+                    "Оплата: {} | Баланс: {:.2f} {}\n"
+                    "Диапазон: {:.1f}–{:.1f}% | Порог: {:.1f}% | Скорость: {}s\n"
+                    "Если лучший ниже порога — сигнал не шлётся.".format(
+                        icon, best_line, pay_label(), balance, FIAT,
+                        spread_min, spread_max, alert, poll
+                    ),
+                    reply_markup=kb_main()
                 )
                 last_edit = now
 
-            # SIGNAL: если лучший >= порога
+            # SIGNAL
             if top5:
                 spread, b, s = top5[0]
                 bp = get_price(b)
                 sp = get_price(s)
                 if bp is not None and sp is not None:
                     key = (round(bp, 6), round(sp, 6), round(spread, 4))
+
                     if spread >= alert and key != _last_signal_key:
                         b_adv = b.get("adv") or {}
                         s_adv = s.get("adv") or {}
@@ -563,12 +637,15 @@ def scanner_loop():
                         b_tr, b_comp = get_adv_stats(b)
                         s_tr, s_comp = get_adv_stats(s)
 
+                        est_profit = profit_eur(balance, spread)
+
                         signal = {
                             "fiat": FIAT,
                             "asset": ASSET,
                             "amount": balance,
                             "payType": pay_label(),
                             "spread_percent": round(spread, 4),
+                            "profit_est_eur": round(est_profit, 4),
                             "buy_price": bp,
                             "sell_price": sp,
                             "buy_limits": [b_mn, b_mx],
@@ -585,7 +662,7 @@ def scanner_loop():
                             if ai is not None and not ai["ok"]:
                                 _last_signal_key = key
                                 tg_send(chat_id, f"⚠️ AI отсеял сигнал (score={ai['score']:.2f}): {ai['reason']}",
-                                        reply_markup=main_menu())
+                                        reply_markup=kb_main())
                                 time.sleep(poll)
                                 continue
                             if ai is not None:
@@ -593,21 +670,22 @@ def scanner_loop():
 
                         msg = (
                             "🔥 SIGNAL\n"
-                            f"BUY {bp:.4f} ({b_name}) -> SELL {sp:.4f} ({s_name})\n"
-                            f"spread={spread:.2f}% | amount={balance:.2f} {FIAT}\n"
-                            f"Оплата={pay_label()} | Диапазон={spread_min:.1f}–{spread_max:.1f}% | Порог>={alert:.1f}%\n"
-                            f"BUY limits : {b_adv.get('minSingleTransAmount')}..{b_adv.get('maxSingleTransAmount')} {FIAT}\n"
-                            f"SELL limits: {s_adv.get('minSingleTransAmount')}..{s_adv.get('maxSingleTransAmount')} {FIAT}"
+                            f"BUY {bp:.4f} ({b_name})  →  SELL {sp:.4f} ({s_name})\n"
+                            f"Спред: {spread:.2f}% | Примерная прибыль: ~{est_profit:.2f}€ (на {balance:.2f}€)\n"
+                            f"Оплата: {pay_label()} | Диапазон: {spread_min:.1f}–{spread_max:.1f}% | Порог: {alert:.1f}%\n"
+                            f"BUY лимиты : {b_adv.get('minSingleTransAmount')}..{b_adv.get('maxSingleTransAmount')} {FIAT}\n"
+                            f"SELL лимиты: {s_adv.get('minSingleTransAmount')}..{s_adv.get('maxSingleTransAmount')} {FIAT}\n"
+                            f"BUY trades/comp: {b_tr}/{b_comp:.1f}% | SELL trades/comp: {s_tr}/{s_comp:.1f}%"
                             + ai_note
                         )
-                        tg_send(chat_id, msg, reply_markup=main_menu())
+                        tg_send(chat_id, msg, reply_markup=kb_main())
                         _last_signal_key = key
 
             time.sleep(poll)
 
         except Exception as e:
             try:
-                tg_send(STATE["chat_id"], f"Ошибка: {repr(e)}", reply_markup=main_menu())
+                tg_send(STATE["chat_id"], f"Ошибка: {repr(e)}", reply_markup=kb_main())
             except Exception:
                 pass
             time.sleep(5)
@@ -620,14 +698,14 @@ def start_scanner(chat_id: int):
         return
 
     if STATE["running"]:
-        tg_send(chat_id, "Уже запущено.", reply_markup=main_menu())
+        tg_send(chat_id, "Уже запущено.", reply_markup=kb_main())
         return
 
     STATE["chat_id"] = chat_id
     STATE["running"] = True
 
     _stop_event.clear()
-    STATE["scan_msg_id"] = tg_send(chat_id, "🔎 Сканирую…", reply_markup=main_menu())
+    STATE["scan_msg_id"] = tg_send(chat_id, "🔎 Запускаю сканирование…", reply_markup=kb_main())
 
     _worker_thread = threading.Thread(target=scanner_loop, daemon=True)
     _worker_thread.start()
@@ -636,14 +714,14 @@ def start_scanner(chat_id: int):
 def stop_scanner(chat_id: int, silent: bool = False):
     if not STATE["running"]:
         if not silent:
-            tg_send(chat_id, "Уже остановлено.", reply_markup=main_menu())
+            tg_send(chat_id, "Уже остановлено.", reply_markup=kb_main())
         return
 
     STATE["running"] = False
     _stop_event.set()
 
     if not silent:
-        tg_send(chat_id, "⏸ Остановлено.", reply_markup=main_menu())
+        tg_send(chat_id, "⏸ Остановлено.", reply_markup=kb_main())
 
 
 def send_top5(chat_id: int):
@@ -651,7 +729,7 @@ def send_top5(chat_id: int):
         return
 
     tg_action(chat_id, "typing")
-    mid = tg_send(chat_id, "🔎 Ищу ТОП-5…", reply_markup=main_menu())
+    mid = tg_send(chat_id, "🔎 Считаю ТОП-5…", reply_markup=kb_main())
 
     balance = float(STATE["balance"])
     pay_types = list(STATE["pay_types"])
@@ -663,26 +741,27 @@ def send_top5(chat_id: int):
     buys = fetch_multi_pages("BUY", pay_types, rows=rows, pages=pages)
     sells = fetch_multi_pages("SELL", pay_types, rows=rows, pages=pages)
 
-    pairs = top_pairs_in_range(buys, sells, balance, spread_min, spread_max, n=5)
+    pairs = top_pairs_in_range_fast(buys, sells, balance, spread_min, spread_max, n=5)
     if not pairs:
-        tg_edit(chat_id, mid, "Не нашёл связок в выбранном диапазоне под твой баланс/фильтры.", reply_markup=main_menu())
+        tg_edit(chat_id, mid, "Не нашёл связок в выбранном диапазоне под твой баланс/фильтры.", reply_markup=kb_main())
         return
 
     lines = [f"🧾 ТОП-5 (диапазон {spread_min:.1f}–{spread_max:.1f}%)\n"]
     for i, (spread, b, s) in enumerate(pairs, start=1):
         bp = get_price(b) or 0.0
         sp = get_price(s) or 0.0
+        est = profit_eur(balance, spread)
         b_name = (b.get("advertiser") or {}).get("nickName", "seller")
         s_name = (s.get("advertiser") or {}).get("nickName", "buyer")
         b_mn, b_mx = get_limits(b)
         s_mn, s_mx = get_limits(s)
 
         lines.append(
-            f"{i}) {spread:.2f}% | BUY {bp:.4f} ({b_name}) -> SELL {sp:.4f} ({s_name})\n"
+            f"{i}) {spread:.2f}% (~{est:.2f}€) | BUY {bp:.4f} ({b_name}) → SELL {sp:.4f} ({s_name})\n"
             f"   BUY {b_mn}..{b_mx} {FIAT} | SELL {s_mn}..{s_mx} {FIAT}"
         )
 
-    tg_edit(chat_id, mid, "\n".join(lines), reply_markup=main_menu())
+    tg_edit(chat_id, mid, "\n".join(lines), reply_markup=kb_main())
 
 
 # =========================
@@ -691,13 +770,21 @@ def send_top5(chat_id: int):
 def handle_message(chat_id: int, text: str):
     if text.startswith("/start"):
         STATE["chat_id"] = chat_id
-        tg_send(
-            chat_id,
-            "Привет! 👋\n"
-            "1) Введи баланс: balance 250\n"
-            "2) Потом можно пройти пошагово «⚙️ Настроить и старт»",
-            reply_markup=main_menu()
-        )
+        if STATE["balance_set"]:
+            # если баланс уже был — показываем соответствующую панель
+            if preflight(chat_id):
+                tg_send(chat_id, "Меню:", reply_markup=kb_main())
+            else:
+                tg_send(chat_id, "Продолжим настройку через ⚙️ Настроить.", reply_markup=kb_start())
+        else:
+            tg_send(
+                chat_id,
+                "Привет! 👋\n\n"
+                "Сначала введи баланс сообщением, например:\n"
+                "balance 200\n\n"
+                "После этого нажми ⚙️ Настроить.",
+                reply_markup=kb_start()
+            )
         return
 
     if text.lower().startswith("balance"):
@@ -705,72 +792,48 @@ def handle_message(chat_id: int, text: str):
         if len(parts) >= 2:
             v = safe_float(parts[1], None)
             if v is None or v <= 0:
-                tg_send(chat_id, "Баланс должен быть числом > 0. Пример: balance 200", reply_markup=main_menu())
+                tg_send(chat_id, "Баланс должен быть числом > 0. Пример: balance 200", reply_markup=kb_start())
                 return
             STATE["balance"] = float(v)
             STATE["balance_set"] = True
-            tg_send(chat_id, f"✅ Баланс: {v:.2f} {FIAT}", reply_markup=main_menu())
+
+            # если хочешь: авто-дефолты под баланс (можно быстро ловить)
+            if STATE["balance"] <= 300:
+                STATE["alert_spread"] = 0.3
+                STATE["spread_min"] = 0.0
+                STATE["spread_max"] = 1.2
+
+            tg_send(chat_id, f"✅ Баланс установлен: {v:.2f} {FIAT}\nТеперь нажми ⚙️ Настроить.",
+                    reply_markup=kb_start())
             return
-        tg_send(chat_id, "Пример: balance 200", reply_markup=main_menu())
+
+        tg_send(chat_id, "Пример: balance 200", reply_markup=kb_start())
         return
 
-    tg_send(chat_id, "Используй кнопки меню или напиши: balance 200", reply_markup=main_menu())
+    # любое другое сообщение
+    if preflight(chat_id):
+        tg_send(chat_id, "Используй кнопки меню 👇", reply_markup=kb_main())
+    else:
+        tg_send(chat_id, "Сначала введи баланс (balance 200) и пройди ⚙️ Настроить.", reply_markup=kb_start())
 
 
 def handle_callback(chat_id: int, data: str):
-    # меню
-    if data == "BACK:MENU":
-        tg_send(chat_id, "Меню:", reply_markup=main_menu())
-        return
-
-    if data == "MENU:PAY":
-        tg_send(chat_id, "Выбери оплату 💳", reply_markup=pay_buttons())
-        return
-
-    if data == "MENU:SPEED":
-        tg_send(chat_id, "Выбери скорость ⏱", reply_markup=speed_buttons())
-        return
-
-    if data == "MENU:RANGE":
-        tg_send(chat_id, "Выбери диапазон 📈", reply_markup=range_buttons())
-        return
-
-    if data == "MENU:ALERT":
-        tg_send(chat_id, "Выбери порог ⚡", reply_markup=alert_buttons())
-        return
-
-    if data == "MENU:STATUS":
-        tg_send(chat_id, status_text(), reply_markup=main_menu())
-        return
-
-    if data == "MENU:HELP":
-        tg_send(chat_id, help_text(), reply_markup=main_menu())
-        return
-
-    if data == "MENU:TOP5":
-        send_top5(chat_id)
-        return
-
-    if data == "MENU:RUN":
-        start_scanner(chat_id)
-        return
-
-    if data == "MENU:STOP":
-        stop_scanner(chat_id)
-        return
-
-    if data == "MENU:AI":
-        STATE["ai_enabled"] = not STATE["ai_enabled"]
-        tg_send(chat_id, f"🤖 AI теперь: {'ON' if STATE['ai_enabled'] else 'OFF'}", reply_markup=main_menu())
-        return
-
+    # общие
     if data == "MENU:RESET":
         reset_all(chat_id)
         return
 
-    # мастер
+    if data == "MENU:HELP":
+        tg_send(chat_id, help_text(), reply_markup=kb_start() if not preflight(chat_id) else kb_main())
+        return
+
+    # старт мастера
     if data == "WIZ:START":
         wizard_start(chat_id)
+        return
+
+    if data == "BACK:WIZ":
+        wizard_go_step(chat_id)
         return
 
     # выбор оплаты
@@ -778,10 +841,12 @@ def handle_callback(chat_id: int, data: str):
         val = data.split(":", 1)[1]
         STATE["pay_types"] = [] if val == "ANY" else [val]
         STATE["pay_set"] = True
-        tg_send(chat_id, f"✅ Оплата: {pay_label()}", reply_markup=main_menu())
 
+        # продвигаем мастер
         if STATE.get("wizard_step") == 1:
             wizard_next(chat_id)
+        else:
+            tg_send(chat_id, f"✅ Оплата: {pay_label()}", reply_markup=kb_main() if preflight(chat_id) else kb_start())
         return
 
     # выбор диапазона
@@ -794,36 +859,97 @@ def handle_callback(chat_id: int, data: str):
                 STATE["spread_min"] = float(mn)
                 STATE["spread_max"] = float(mx)
                 STATE["range_set"] = True
-                tg_send(chat_id, f"✅ Диапазон: {STATE['spread_min']:.1f}–{STATE['spread_max']:.1f}%",
-                        reply_markup=main_menu())
+
                 if STATE.get("wizard_step") == 2:
                     wizard_next(chat_id)
+                else:
+                    tg_send(chat_id, f"✅ Диапазон: {mn:.1f}–{mx:.1f}%", reply_markup=kb_main())
                 return
-        tg_send(chat_id, "Ошибка диапазона.", reply_markup=main_menu())
+        tg_send(chat_id, "Ошибка диапазона.", reply_markup=kb_start())
         return
 
     # выбор порога
     if data.startswith("ALERT:"):
         val = safe_float(data.split(":", 1)[1], None)
         if val is None:
-            tg_send(chat_id, "Ошибка порога.", reply_markup=main_menu())
+            tg_send(chat_id, "Ошибка порога.", reply_markup=kb_start())
             return
         STATE["alert_spread"] = float(val)
         STATE["alert_set"] = True
-        tg_send(chat_id, f"✅ Порог: {STATE['alert_spread']:.1f}%", reply_markup=main_menu())
+
         if STATE.get("wizard_step") == 3:
             wizard_next(chat_id)
+        else:
+            tg_send(chat_id, f"✅ Порог: {STATE['alert_spread']:.1f}%", reply_markup=kb_main())
         return
 
     # выбор скорости
     if data.startswith("SPD:"):
-        sec = safe_int(data.split(":", 1)[1], 15)
+        sec = safe_int(data.split(":", 1)[1], 5)
         sec = max(5, min(60, sec))
         STATE["poll_seconds"] = sec
         STATE["speed_set"] = True
-        tg_send(chat_id, f"✅ Скорость: {sec}s", reply_markup=main_menu())
+
         if STATE.get("wizard_step") == 4:
-            wizard_next(chat_id)
+            STATE["wizard_step"] = 5
+            tg_send(chat_id, "✅ Настройка завершена. Жми ▶️ Старт.", reply_markup=kb_main())
+        else:
+            tg_send(chat_id, f"✅ Скорость: {sec}s", reply_markup=kb_main())
+        return
+
+    # меню (полная панель доступна только после preflight)
+    if data == "MENU:PAY":
+        if not STATE["balance_set"]:
+            tg_send(chat_id, "Сначала введи баланс: balance 200", reply_markup=kb_start())
+            return
+        STATE["wizard_step"] = 1
+        tg_send(chat_id, "Шаг 1/4 — выбери оплату 💳", reply_markup=pay_buttons())
+        return
+
+    if data == "MENU:RANGE":
+        if not STATE["balance_set"]:
+            tg_send(chat_id, "Сначала введи баланс: balance 200", reply_markup=kb_start())
+            return
+        STATE["wizard_step"] = 2
+        tg_send(chat_id, "Шаг 2/4 — выбери диапазон 📈", reply_markup=range_buttons())
+        return
+
+    if data == "MENU:ALERT":
+        if not STATE["balance_set"]:
+            tg_send(chat_id, "Сначала введи баланс: balance 200", reply_markup=kb_start())
+            return
+        STATE["wizard_step"] = 3
+        tg_send(chat_id, "Шаг 3/4 — выбери порог ⚡", reply_markup=alert_buttons())
+        return
+
+    if data == "MENU:SPEED":
+        if not STATE["balance_set"]:
+            tg_send(chat_id, "Сначала введи баланс: balance 200", reply_markup=kb_start())
+            return
+        STATE["wizard_step"] = 4
+        tg_send(chat_id, "Шаг 4/4 — выбери скорость ⏱", reply_markup=speed_buttons())
+        return
+
+    if data == "MENU:STATUS":
+        tg_send(chat_id, status_text(), reply_markup=kb_main() if preflight(chat_id) else kb_start())
+        return
+
+    if data == "MENU:AI":
+        STATE["ai_enabled"] = not STATE["ai_enabled"]
+        tg_send(chat_id, f"🤖 AI теперь: {'ON' if STATE['ai_enabled'] else 'OFF'}",
+                reply_markup=kb_main() if preflight(chat_id) else kb_start())
+        return
+
+    if data == "MENU:TOP5":
+        send_top5(chat_id)
+        return
+
+    if data == "MENU:RUN":
+        start_scanner(chat_id)
+        return
+
+    if data == "MENU:STOP":
+        stop_scanner(chat_id)
         return
 
 
