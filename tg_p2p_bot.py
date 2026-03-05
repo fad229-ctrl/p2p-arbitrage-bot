@@ -4,16 +4,9 @@ import threading
 import requests
 from typing import Dict, Any, List, Optional, Tuple
 
-# =========================
-# ENV VARS (Render/локально)
-# =========================
 TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
-# Можно ограничить доступ только твоим chat_id (рекомендую)
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "").strip()  # например "123456789" или пусто
 
-# =========================
-# Binance P2P settings
-# =========================
 P2P_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 HEADERS = {
     "accept": "*/*",
@@ -29,9 +22,6 @@ ROWS = 20
 ASSET = "USDT"
 FIAT = "EUR"
 
-# =========================
-# Telegram API helper
-# =========================
 TG_API = "https://api.telegram.org/bot{}/{}"
 
 def tg_call(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -48,9 +38,6 @@ def tg_send(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = No
         payload["reply_markup"] = reply_markup
     tg_call("sendMessage", payload)
 
-# =========================
-# Utils
-# =========================
 def safe_float(x, default=None):
     try:
         return float(str(x).replace(",", "."))
@@ -73,10 +60,10 @@ def fetch_ads(trade_type: str, pay_types: List[str], rows: int = ROWS) -> Dict[s
     payload = {
         "page": 1,
         "rows": rows,
-        "payTypes": pay_types,   # [] => любые
+        "payTypes": pay_types,
         "asset": ASSET,
         "fiat": FIAT,
-        "tradeType": trade_type  # "BUY" / "SELL"
+        "tradeType": trade_type
     }
     r = requests.post(P2P_URL, headers=HEADERS, json=payload, timeout=15)
     r.raise_for_status()
@@ -136,7 +123,6 @@ def best_pair(
     return best
 
 def recommend_threshold(balance: float) -> float:
-    # "Нормальный" порог: чем меньше баланс — тем выше надо ставить, чтобы время/срыв окупались
     if balance < 100:
         return 2.4
     if balance < 500:
@@ -145,13 +131,10 @@ def recommend_threshold(balance: float) -> float:
         return 1.5
     return 1.2
 
-# =========================
-# Bot state + scanner thread
-# =========================
 STATE = {
-    "chat_id": None,           # куда слать сигналы
+    "chat_id": None,
     "balance": 100.0,
-    "pay_types": ["SEPA"],     # ["SEPA"] / ["Revolut"] / ["Wise"] / [] (ANY)
+    "pay_types": ["SEPA"],  # [] means ANY
     "running": False,
     "threshold": 1.9
 }
@@ -164,6 +147,16 @@ def is_allowed(chat_id: int) -> bool:
     if not ALLOWED_CHAT_ID:
         return True
     return str(chat_id) == ALLOWED_CHAT_ID
+
+def pay_buttons() -> Dict[str, Any]:
+    return {
+        "inline_keyboard": [[
+            {"text": "SEPA", "callback_data": "PAY:SEPA"},
+            {"text": "Revolut", "callback_data": "PAY:Revolut"},
+            {"text": "Wise", "callback_data": "PAY:Wise"},
+            {"text": "Любые", "callback_data": "PAY:ANY"},
+        ]]
+    }
 
 def scanner_loop():
     global _last_signal_key
@@ -221,20 +214,6 @@ def scanner_loop():
                 pass
             time.sleep(max(10, POLL_SECONDS))
 
-# =========================
-# Telegram updates loop
-# =========================
-def pay_buttons() -> Dict[str, Any]:
-    # inline клавиатура
-    return {
-        "inline_keyboard": [[
-            {"text": "SEPA", "callback_data": "PAY:SEPA"},
-            {"text": "Revolut", "callback_data": "PAY:Revolut"},
-            {"text": "Wise", "callback_data": "PAY:Wise"},
-            {"text": "Любые", "callback_data": "PAY:ANY"},
-        ]]
-    }
-
 def start_scanner(chat_id: int):
     global _worker_thread
     if STATE["running"]:
@@ -266,15 +245,16 @@ def status(chat_id: int):
     )
 
 def handle_message(chat_id: int, text: str):
-    # Команды
     if text.startswith("/start"):
         STATE["chat_id"] = chat_id
-        tg_send(chat_id,
-                "Привет! Я P2P-сканер.\n"
-                "1) /config — выбрать оплату кнопкой\n"
-                "2) Напиши: balance 250  (чтобы задать баланс)\n"
-                "3) /run — запустить, /stop — остановить\n"
-                "4) /status — статус")
+        tg_send(
+            chat_id,
+            "Привет! Я P2P-сканер.\n"
+            "1) /config — выбрать оплату кнопкой\n"
+            "2) Напиши: balance 250\n"
+            "3) /run — старт, /stop — стоп\n"
+            "4) /status — статус"
+        )
         return
 
     if text.startswith("/config"):
@@ -294,7 +274,6 @@ def handle_message(chat_id: int, text: str):
         status(chat_id)
         return
 
-    # Установка баланса: "balance 150"
     if text.lower().startswith("balance"):
         parts = text.split()
         if len(parts) >= 2:
@@ -314,16 +293,9 @@ def handle_message(chat_id: int, text: str):
 def handle_callback(chat_id: int, data: str):
     if data.startswith("PAY:"):
         val = data.split(":", 1)[1]
-        if val == "ANY":
-            STATE["pay_types"] = []
-        else:
-            STATE["pay_types"] = [val]
+        STATE["pay_types"] = [] if val == "ANY" else [val]
         tg_send(chat_id, f"✅ Метод оплаты: {'ANY' if not STATE['pay_types'] else STATE['pay_types'][0]}")
         status(chat_id)
-
-def run_updates_loop():
-    offset = 0
-    tg_send(int(ALLOWED_CHAT_ID) if ALLOWED_CHAT_ID else 0, "")  # no-op attempt? removed; keep simple
 
 def main():
     if not TG_TOKEN:
@@ -338,27 +310,22 @@ def main():
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
 
-                # messages
                 if "message" in upd and "text" in upd["message"]:
                     chat_id = upd["message"]["chat"]["id"]
                     if not is_allowed(chat_id):
                         continue
-                    text = upd["message"]["text"]
-                    handle_message(chat_id, text)
+                    handle_message(chat_id, upd["message"]["text"])
 
-                # inline buttons
                 if "callback_query" in upd:
                     cq = upd["callback_query"]
                     chat_id = cq["message"]["chat"]["id"]
                     if not is_allowed(chat_id):
                         continue
-                    cb_data = cq.get("data", "")
-                    # ack callback
                     try:
                         tg_call("answerCallbackQuery", {"callback_query_id": cq["id"]})
                     except Exception:
                         pass
-                    handle_callback(chat_id, cb_data)
+                    handle_callback(chat_id, cq.get("data", ""))
 
         except Exception as e:
             print("Error:", repr(e))
