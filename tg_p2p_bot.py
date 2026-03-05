@@ -12,7 +12,7 @@ ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "").strip()  # например "
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
-AI_DEFAULT_ENABLED = os.getenv("AI_ENABLED", "0").strip() in ("1", "true", "True", "yes", "YES")
+AI_DEFAULT_ENABLED = os.getenv("AI_ENABLED", "0").strip().lower() in ("1", "true", "yes")
 
 # =========================
 # Binance P2P
@@ -24,11 +24,15 @@ HEADERS = {
     "user-agent": "Mozilla/5.0 (p2p-scanner)"
 }
 
+# Фильтры (мягкие, чтобы было больше сигналов)
 MIN_USER_TRADES = 50
 MIN_COMPLETION_RATE = 90.0
-DEFAULT_THRESHOLD = 1.0     # было 1.9
-ROWS = 100                 # было 20
-PAGES = 5                  # сколько страниц брать (5*100=500 объявлений)
+
+# Глубина рынка
+DEFAULT_THRESHOLD = 1.0
+DEFAULT_ROWS = 100     # сколько объявлений на страницу
+DEFAULT_PAGES = 5      # сколько страниц (rows*pages = до 500 объявлений)
+
 ASSET = "USDT"
 FIAT = "EUR"
 
@@ -165,15 +169,16 @@ def fetch_ads(trade_type: str, pay_types: List[str], rows: int, page: int = 1) -
     payload = {
         "page": page,
         "rows": rows,
-        "payTypes": pay_types,
+        "payTypes": pay_types,   # [] => любые
         "asset": ASSET,
         "fiat": FIAT,
-        "tradeType": trade_type
+        "tradeType": trade_type  # "BUY" / "SELL"
     }
     r = requests.post(P2P_URL, headers=HEADERS, json=payload, timeout=15)
     r.raise_for_status()
     return r.json()
-    
+
+
 def fetch_multi_pages(trade_type: str, pay_types: List[str], rows: int, pages: int) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for p in range(1, pages + 1):
@@ -181,6 +186,7 @@ def fetch_multi_pages(trade_type: str, pay_types: List[str], rows: int, pages: i
         out.extend(data.get("data") or [])
         time.sleep(0.2)  # маленькая пауза, чтобы не долбить Binance
     return out
+
 
 def get_price(item: Dict[str, Any]) -> Optional[float]:
     adv = item.get("adv") or {}
@@ -227,7 +233,7 @@ def best_pair(
     buy_ok = [b for b in buys if passes_filters(b, amount_fiat)]
     sell_ok = [s for s in sells if passes_filters(s, amount_fiat)]
 
-    best = None
+    best: Optional[Tuple[float, Dict[str, Any], Dict[str, Any]]] = None
     for b in buy_ok:
         bp = get_price(b)
         if bp is None:
@@ -266,16 +272,6 @@ def top_pairs(
     return pairs[:n]
 
 
-def recommend_threshold(balance: float) -> float:
-    if balance < 100:
-        return 2.4
-    if balance < 500:
-        return 1.9
-    if balance < 2000:
-        return 1.5
-    return 1.2
-
-
 # =========================
 # Texts / UI
 # =========================
@@ -288,9 +284,10 @@ def help_text() -> str:
         "3) Настрой кнопками:\n"
         "   💳 Оплата — SEPA/Revolut/Wise/ANY\n"
         "   ⏱ Скорость — как часто бот сканирует рынок (5–30 секунд)\n"
+        "   ⚡ Порог — минимальный спред для сигнала\n"
         "   🤖 AI — фильтр рискованных сигналов (по желанию)\n\n"
-        "4) ▶️ Старт — начнёт постоянное сканирование\n"
-        "5) 📋 ТОП-5 — покажет 5 лучших связок прямо сейчас\n\n"
+        "4) ▶️ Старт — постоянное сканирование\n"
+        "5) 📋 ТОП-5 — 5 лучших связок прямо сейчас\n\n"
         "Важно:\n"
         "• Не пиши 'crypto/binance' в комментарии перевода.\n"
         "• Не принимай оплату от третьих лиц.\n"
@@ -304,7 +301,7 @@ def status_text() -> str:
         f"balance: {STATE['balance']} {FIAT} (set={STATE['balance_set']})\n"
         f"payTypes: {'ANY' if not STATE['pay_types'] else ','.join(STATE['pay_types'])} (set={STATE['pay_set']})\n"
         f"threshold: {STATE['threshold']:.1f}%\n"
-        f"speed: {STATE['poll_seconds']}s | rows: {STATE['rows']}\n"
+        f"speed: {STATE['poll_seconds']}s | rows: {STATE['rows']} | pages: {STATE['pages']}\n"
         f"AI: {'ON' if STATE['ai_enabled'] else 'OFF'}\n"
         f"filters: trades>={MIN_USER_TRADES}, completion>={MIN_COMPLETION_RATE}%"
     )
@@ -314,6 +311,7 @@ def main_menu() -> Dict[str, Any]:
     pay = "ANY" if not STATE["pay_types"] else STATE["pay_types"][0]
     ai = "ON" if STATE["ai_enabled"] else "OFF"
     spd = f"{STATE['poll_seconds']}s"
+    thr = f"{STATE['threshold']:.1f}%"
     return {
         "inline_keyboard": [
             [
@@ -322,7 +320,7 @@ def main_menu() -> Dict[str, Any]:
             ],
             [
                 {"text": f"⏱ Скорость: {spd}", "callback_data": "MENU:SPEED"},
-                {"text": f"⚡ Порог: {STATE['threshold']:.1f}%", "callback_data": "MENU:THR"},
+                {"text": f"⚡ Порог: {thr}", "callback_data": "MENU:THR"},
                 {"text": "📌 Статус", "callback_data": "MENU:STATUS"},
             ],
             [
@@ -365,6 +363,7 @@ def speed_buttons() -> Dict[str, Any]:
         ]]
     }
 
+
 def threshold_buttons() -> Dict[str, Any]:
     return {
         "inline_keyboard": [[
@@ -386,13 +385,16 @@ def threshold_buttons() -> Dict[str, Any]:
 STATE = {
     "chat_id": None,
     "balance": 0.0,
-    "balance_set": False,       # станет True после "balance 250"
-    "pay_types": ["SEPA"],      # дефолт
-    "pay_set": False,           # станет True после выбора кнопкой оплаты
+    "balance_set": False,     # станет True после "balance 250"
+    "pay_types": ["SEPA"],    # дефолт
+    "pay_set": False,         # станет True после выбора кнопкой оплаты
     "running": False,
-    "threshold": 1.2,
+
+    "threshold": DEFAULT_THRESHOLD,
     "poll_seconds": 15,
-    "rows": 100,
+    "rows": DEFAULT_ROWS,
+    "pages": DEFAULT_PAGES,
+
     "ai_enabled": AI_DEFAULT_ENABLED,
     "scan_msg_id": 0,
 }
@@ -400,7 +402,7 @@ STATE = {
 _stop_event = threading.Event()
 _worker_thread: Optional[threading.Thread] = None
 _last_signal_key = None
-_spinner = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+_spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 
 def is_allowed(chat_id: int) -> bool:
@@ -433,7 +435,9 @@ def scanner_loop():
             threshold = float(STATE["threshold"])
             poll = int(STATE["poll_seconds"])
             rows = int(STATE["rows"])
+            pages = int(STATE["pages"])
 
+            # "анимация" — typing + обновляем сообщение раз в ~3 сек
             tg_action(chat_id, "typing")
             now = time.time()
             if STATE["scan_msg_id"] and (now - last_edit) > 3:
@@ -449,8 +453,8 @@ def scanner_loop():
                 )
                 last_edit = now
 
-           buys = fetch_multi_pages("BUY", pay_types, rows=ROWS, pages=PAGES)
-           sells = fetch_multi_pages("SELL", pay_types, rows=ROWS, pages=PAGES)
+            buys = fetch_multi_pages("BUY", pay_types, rows=rows, pages=pages)
+            sells = fetch_multi_pages("SELL", pay_types, rows=rows, pages=pages)
 
             pair = best_pair(buys, sells, balance)
             if not pair:
@@ -461,10 +465,14 @@ def scanner_loop():
             bp = get_price(b)
             sp = get_price(s)
 
+            if bp is None or sp is None:
+                time.sleep(poll)
+                continue
+
             b_name = (b.get("advertiser") or {}).get("nickName", "seller")
             s_name = (s.get("advertiser") or {}).get("nickName", "buyer")
 
-            key = (round(bp or 0, 6), round(sp or 0, 6), round(spread, 4))
+            key = (round(bp, 6), round(sp, 6), round(spread, 4))
 
             if spread >= threshold and key != _last_signal_key:
                 b_adv = b.get("adv") or {}
@@ -495,8 +503,9 @@ def scanner_loop():
                     ai = openai_score(signal)
                     if ai is not None:
                         if not ai["ok"]:
-                            _last_signal_key = key
-                            tg_send(chat_id, f"⚠️ AI отсеял сигнал (score={ai['score']:.2f}): {ai['reason']}")
+                            _last_signal_key = key  # чтобы не спамить тем же
+                            tg_send(chat_id, f"⚠️ AI отсеял сигнал (score={ai['score']:.2f}): {ai['reason']}",
+                                    reply_markup=main_menu())
                             time.sleep(poll)
                             continue
                         ai_note = f"\n🤖 AI: OK (score={ai['score']:.2f}) — {ai['reason']}"
@@ -510,7 +519,7 @@ def scanner_loop():
                     f"SELL limits: {s_adv.get('minSingleTransAmount')}..{s_adv.get('maxSingleTransAmount')} {FIAT}"
                     + ai_note
                 )
-                tg_send(chat_id, msg)
+                tg_send(chat_id, msg, reply_markup=main_menu())
                 _last_signal_key = key
 
             time.sleep(poll)
@@ -518,7 +527,7 @@ def scanner_loop():
         except Exception as e:
             try:
                 if STATE["chat_id"]:
-                    tg_send(STATE["chat_id"], f"Ошибка: {repr(e)}")
+                    tg_send(STATE["chat_id"], f"Ошибка: {repr(e)}", reply_markup=main_menu())
             except Exception:
                 pass
             time.sleep(max(5, int(STATE["poll_seconds"])))
@@ -559,12 +568,11 @@ def send_top5(chat_id: int):
 
     balance = float(STATE["balance"])
     pay_types = list(STATE["pay_types"])
-    rows = max(30, int(STATE["rows"]))  # чуть шире для top5
+    rows = max(30, int(STATE["rows"]))
+    pages = int(STATE["pages"])
 
-    buy_data = fetch_ads("BUY", pay_types, rows=rows)
-    sell_data = fetch_ads("SELL", pay_types, rows=rows)
-    buys = buy_data.get("data") or []
-    sells = sell_data.get("data") or []
+    buys = fetch_multi_pages("BUY", pay_types, rows=rows, pages=pages)
+    sells = fetch_multi_pages("SELL", pay_types, rows=rows, pages=pages)
 
     pairs = top_pairs(buys, sells, balance, n=5)
     if not pairs:
@@ -600,6 +608,7 @@ def handle_message(chat_id: int, text: str):
         )
         return
 
+    # Баланс — вручную
     if text.lower().startswith("balance"):
         parts = text.split()
         if len(parts) >= 2:
@@ -609,12 +618,8 @@ def handle_message(chat_id: int, text: str):
                 return
             STATE["balance"] = float(v)
             STATE["balance_set"] = True
-            STATE["threshold"] = recommend_threshold(float(v))
-            tg_send(
-                chat_id,
-                f"✅ Баланс: {v:.2f} {FIAT}\nПорог (бот выбрал): {STATE['threshold']:.1f}%",
-                reply_markup=main_menu()
-            )
+            # порог НЕ перетираем (управляется кнопкой)
+            tg_send(chat_id, f"✅ Баланс: {v:.2f} {FIAT}", reply_markup=main_menu())
             return
         tg_send(chat_id, "Пример: balance 200", reply_markup=main_menu())
         return
@@ -632,6 +637,10 @@ def handle_callback(chat_id: int, data: str):
         tg_send(chat_id, "Выбери скорость сканирования:", reply_markup=speed_buttons())
         return
 
+    if data == "MENU:THR":
+        tg_send(chat_id, "Выбери порог спреда:", reply_markup=threshold_buttons())
+        return
+
     if data == "MENU:STATUS":
         tg_send(chat_id, status_text(), reply_markup=main_menu())
         return
@@ -645,7 +654,6 @@ def handle_callback(chat_id: int, data: str):
         return
 
     if data == "MENU:SETUPRUN":
-        # проверка и запуск
         if preflight(chat_id):
             start_scanner(chat_id)
         return
@@ -673,7 +681,8 @@ def handle_callback(chat_id: int, data: str):
         val = data.split(":", 1)[1]
         STATE["pay_types"] = [] if val == "ANY" else [val]
         STATE["pay_set"] = True
-        tg_send(chat_id, f"✅ Оплата: {'ANY' if not STATE['pay_types'] else STATE['pay_types'][0]}", reply_markup=main_menu())
+        tg_send(chat_id, f"✅ Оплата: {'ANY' if not STATE['pay_types'] else STATE['pay_types'][0]}",
+                reply_markup=main_menu())
         return
 
     # Скорость
@@ -683,18 +692,16 @@ def handle_callback(chat_id: int, data: str):
         STATE["poll_seconds"] = sec
         tg_send(chat_id, f"✅ Скорость: {sec}s", reply_markup=main_menu())
         return
-    if data == "MENU:THR":
-        tg_send(chat_id, "Выбери порог спреда:", reply_markup=threshold_buttons())
-        return
 
+    # Порог
     if data.startswith("THR:"):
         val = safe_float(data.split(":", 1)[1], None)
         if val is None:
-        tg_send(chat_id, "Ошибка порога.", reply_markup=main_menu())
+            tg_send(chat_id, "Ошибка порога.", reply_markup=main_menu())
+            return
+        STATE["threshold"] = float(val)
+        tg_send(chat_id, f"✅ Порог установлен: {STATE['threshold']:.1f}%", reply_markup=main_menu())
         return
-    STATE["threshold"] = float(val)
-    tg_send(chat_id, f"✅ Порог установлен: {STATE['threshold']:.1f}%", reply_markup=main_menu())
-    return
 
 
 def main():
