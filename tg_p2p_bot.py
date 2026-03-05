@@ -516,7 +516,7 @@ def handle_callback(chat_id: int, data: str):
         tg_send(chat_id, f"🤖 AI теперь: {'ON' if STATE['ai_enabled'] else 'OFF'}", reply_markup=main_menu())
         return
     if data == "MENU:HELP":
-    tg_send(chat_id, help_text(), reply_markup=main_menu())
+        tg_send(chat_id, help_text(), reply_markup=main_menu())
         return
 
     # Назад
