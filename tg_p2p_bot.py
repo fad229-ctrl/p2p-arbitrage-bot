@@ -24,8 +24,8 @@ HEADERS = {
     "user-agent": "Mozilla/5.0 (p2p-scanner)"
 }
 
-MIN_USER_TRADES = 200
-MIN_COMPLETION_RATE = 95.0
+MIN_USER_TRADES = 50
+MIN_COMPLETION_RATE = 90.0
 
 ASSET = "USDT"
 FIAT = "EUR"
@@ -366,9 +366,9 @@ STATE = {
     "pay_types": ["SEPA"],      # дефолт
     "pay_set": False,           # станет True после выбора кнопкой оплаты
     "running": False,
-    "threshold": 1.9,
+    "threshold": 1.2,
     "poll_seconds": 15,
-    "rows": 20,
+    "rows": 100,
     "ai_enabled": AI_DEFAULT_ENABLED,
     "scan_msg_id": 0,
 }
