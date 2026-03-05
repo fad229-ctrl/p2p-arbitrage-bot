@@ -26,7 +26,9 @@ HEADERS = {
 
 MIN_USER_TRADES = 50
 MIN_COMPLETION_RATE = 90.0
-
+DEFAULT_THRESHOLD = 1.0     # было 1.9
+ROWS = 100                 # было 20
+PAGES = 5                  # сколько страниц брать (5*100=500 объявлений)
 ASSET = "USDT"
 FIAT = "EUR"
 
@@ -159,19 +161,26 @@ def completion_to_percent(val) -> float:
     return v
 
 
-def fetch_ads(trade_type: str, pay_types: List[str], rows: int) -> Dict[str, Any]:
+def fetch_ads(trade_type: str, pay_types: List[str], rows: int, page: int = 1) -> Dict[str, Any]:
     payload = {
-        "page": 1,
+        "page": page,
         "rows": rows,
-        "payTypes": pay_types,   # [] => любые
+        "payTypes": pay_types,
         "asset": ASSET,
         "fiat": FIAT,
-        "tradeType": trade_type  # "BUY" / "SELL"
+        "tradeType": trade_type
     }
     r = requests.post(P2P_URL, headers=HEADERS, json=payload, timeout=15)
     r.raise_for_status()
     return r.json()
-
+    
+def fetch_multi_pages(trade_type: str, pay_types: List[str], rows: int, pages: int) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for p in range(1, pages + 1):
+        data = fetch_ads(trade_type, pay_types, rows=rows, page=p)
+        out.extend(data.get("data") or [])
+        time.sleep(0.2)  # маленькая пауза, чтобы не долбить Binance
+    return out
 
 def get_price(item: Dict[str, Any]) -> Optional[float]:
     adv = item.get("adv") or {}
@@ -313,6 +322,7 @@ def main_menu() -> Dict[str, Any]:
             ],
             [
                 {"text": f"⏱ Скорость: {spd}", "callback_data": "MENU:SPEED"},
+                {"text": f"⚡ Порог: {STATE['threshold']:.1f}%", "callback_data": "MENU:THR"},
                 {"text": "📌 Статус", "callback_data": "MENU:STATUS"},
             ],
             [
@@ -352,6 +362,20 @@ def speed_buttons() -> Dict[str, Any]:
             {"text": "30s", "callback_data": "SPD:30"},
         ], [
             {"text": "⬅️ Назад", "callback_data": "BACK:MENU"}
+        ]]
+    }
+
+def threshold_buttons() -> Dict[str, Any]:
+    return {
+        "inline_keyboard": [[
+            {"text": "0.5%", "callback_data": "THR:0.5"},
+            {"text": "0.8%", "callback_data": "THR:0.8"},
+            {"text": "1.0%", "callback_data": "THR:1.0"},
+            {"text": "1.2%", "callback_data": "THR:1.2"},
+        ], [
+            {"text": "1.5%", "callback_data": "THR:1.5"},
+            {"text": "2.0%", "callback_data": "THR:2.0"},
+            {"text": "⬅️ Назад", "callback_data": "BACK:MENU"},
         ]]
     }
 
@@ -425,10 +449,8 @@ def scanner_loop():
                 )
                 last_edit = now
 
-            buy_data = fetch_ads("BUY", pay_types, rows=rows)
-            sell_data = fetch_ads("SELL", pay_types, rows=rows)
-            buys = buy_data.get("data") or []
-            sells = sell_data.get("data") or []
+           buys = fetch_multi_pages("BUY", pay_types, rows=ROWS, pages=PAGES)
+           sells = fetch_multi_pages("SELL", pay_types, rows=ROWS, pages=PAGES)
 
             pair = best_pair(buys, sells, balance)
             if not pair:
@@ -661,6 +683,18 @@ def handle_callback(chat_id: int, data: str):
         STATE["poll_seconds"] = sec
         tg_send(chat_id, f"✅ Скорость: {sec}s", reply_markup=main_menu())
         return
+    if data == "MENU:THR":
+        tg_send(chat_id, "Выбери порог спреда:", reply_markup=threshold_buttons())
+        return
+
+    if data.startswith("THR:"):
+        val = safe_float(data.split(":", 1)[1], None)
+        if val is None:
+        tg_send(chat_id, "Ошибка порога.", reply_markup=main_menu())
+        return
+    STATE["threshold"] = float(val)
+    tg_send(chat_id, f"✅ Порог установлен: {STATE['threshold']:.1f}%", reply_markup=main_menu())
+    return
 
 
 def main():
