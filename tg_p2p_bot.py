@@ -243,6 +243,9 @@ def main_menu() -> Dict[str, Any]:
                 {"text": "📌 Статус", "callback_data": "MENU:STATUS"},
             ],
             [
+                {"text": "📖 Инструкция", "callback_data": "MENU:HELP"},
+            ],
+            [
                 {"text": "▶️ Старт", "callback_data": "MENU:RUN"},
                 {"text": "⏸ Стоп", "callback_data": "MENU:STOP"},
             ],
@@ -309,7 +312,30 @@ def status_text() -> str:
         f"AI: {'ON' if STATE['ai_enabled'] else 'OFF'}\n"
         f"filters: trades>={MIN_USER_TRADES}, completion>={MIN_COMPLETION_RATE}%"
     )
-
+def help_text() -> str:
+    return (
+        "📖 Инструкция по боту\n\n"
+        "1) Запусти: /start\n"
+        "2) Введи баланс (в EUR) сообщением:\n"
+        "   balance 250\n\n"
+        "3) Настрой кнопками:\n"
+        "   💳 Оплата — SEPA/Revolut/Wise/ANY\n"
+        "   ⏱ Скорость — как часто бот сканирует рынок\n"
+        "      5s = чаще (быстрее ловит связки, но больше запросов)\n"
+        "      10–15s = оптимально\n"
+        "      30s = спокойно и экономно\n"
+        "   🤖 AI — фильтр “опасных/фейковых” сигналов (по желанию)\n\n"
+        "4) Нажми ▶️ Старт\n"
+        "   Пока идёт поиск, бот показывает: 🔎 Сканирую…\n"
+        "   Когда найдёт подходящий спред — пришлёт 🔥 SIGNAL.\n\n"
+        "Команды:\n"
+        "• /start — меню\n"
+        "• balance N — установить баланс\n\n"
+        "Важно:\n"
+        "• Не пиши 'crypto/binance' в комментарии перевода.\n"
+        "• Не принимай оплату от третьих лиц (имя отправителя должно совпадать).\n"
+    )
+    
 def scanner_loop():
     global _last_signal_key
     spin_i = 0
@@ -488,6 +514,9 @@ def handle_callback(chat_id: int, data: str):
     if data == "MENU:AI":
         STATE["ai_enabled"] = not STATE["ai_enabled"]
         tg_send(chat_id, f"🤖 AI теперь: {'ON' if STATE['ai_enabled'] else 'OFF'}", reply_markup=main_menu())
+        return
+    if data == "MENU:HELP":
+    tg_send(chat_id, help_text(), reply_markup=main_menu())
         return
 
     # Назад
