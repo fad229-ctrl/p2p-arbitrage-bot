@@ -36,6 +36,60 @@ DEFAULT_PAGES = 5
 CANDIDATES_K = 30
 
 # =========================
+# Оплата по валютам
+# =========================
+PAYMENTS_BY_FIAT: Dict[str, List[str]] = {
+    "EUR": ["ANY", "SEPA", "Revolut", "Wise", "ZEN", "N26", "BankTransfer"],
+    "UAH": ["ANY", "Monobank", "PrivatBank", "A-Bank", "PUMB", "BankTransfer"],
+    "GBP": ["ANY", "FasterPayments", "Revolut", "Wise", "BankTransfer"],
+    "PLN": ["ANY", "Blik", "Revolut", "Wise", "BankTransfer"],
+    "TRY": ["ANY", "Papara", "BankTransfer"],
+    "KZT": ["ANY", "KaspiBank", "HalykBank", "BankTransfer"],
+}
+
+# =========================
+# Ключевые слова для fuzzy matching
+# =========================
+PAYMENT_KEYWORDS: Dict[str, Dict[str, List[str]]] = {
+    "EUR": {
+        "SEPA": ["sepa", "sepa instant"],
+        "Revolut": ["revolut"],
+        "Wise": ["wise"],
+        "ZEN": ["zen"],
+        "N26": ["n26"],
+        "BankTransfer": ["bank transfer", "banktransfer", "банковский перевод", "bank", "transfer"],
+    },
+    "UAH": {
+        "Monobank": ["mono", "monobank", "monobank карта", "mono bank"],
+        "PrivatBank": ["privat", "privatbank", "приват", "приватбанк"],
+        "A-Bank": ["a-bank", "abank", "а-банк"],
+        "PUMB": ["pumb", "пумб"],
+        "BankTransfer": ["bank transfer", "banktransfer", "власний рахунок", "банківський переказ", "bank"],
+    },
+    "GBP": {
+        "FasterPayments": ["faster payments", "fasterpayments", "fps"],
+        "Revolut": ["revolut"],
+        "Wise": ["wise"],
+        "BankTransfer": ["bank transfer", "banktransfer", "bank"],
+    },
+    "PLN": {
+        "Blik": ["blik"],
+        "Revolut": ["revolut"],
+        "Wise": ["wise"],
+        "BankTransfer": ["bank transfer", "banktransfer", "bank", "przelew"],
+    },
+    "TRY": {
+        "Papara": ["papara"],
+        "BankTransfer": ["bank transfer", "banktransfer", "havale", "eft", "bank"],
+    },
+    "KZT": {
+        "KaspiBank": ["kaspi", "kaspi bank", "kaspibank"],
+        "HalykBank": ["halyk", "halyk bank", "halykbank"],
+        "BankTransfer": ["bank transfer", "banktransfer", "bank"],
+    },
+}
+
+# =========================
 # Telegram API
 # =========================
 TG_API = "https://api.telegram.org/bot{}/{}"
@@ -151,15 +205,74 @@ def completion_to_percent(val) -> float:
     return v
 
 
+def normalize_text(s: Any) -> str:
+    return str(s or "").strip().lower()
+
+
 def current_fiat() -> str:
     return STATE["fiat"]
+
+
+def current_pay_options() -> List[str]:
+    return PAYMENTS_BY_FIAT.get(current_fiat(), ["ANY"])
+
+
+def normalize_pay_value(pay_value: str) -> str:
+    return "ANY" if pay_value == "ANY" else pay_value.strip()
+
+
+def ensure_pay_valid_for_fiat() -> None:
+    allowed = set(current_pay_options())
+    if not STATE["pay_types"]:
+        return
+    current = STATE["pay_types"][0]
+    if current not in allowed:
+        STATE["pay_types"] = []
+        STATE["pay_set"] = False
+
+
+def get_trade_method_names(item: Dict[str, Any]) -> List[str]:
+    adv = item.get("adv") or {}
+    methods = adv.get("tradeMethods") or []
+    names: List[str] = []
+
+    for m in methods:
+        if not isinstance(m, dict):
+            continue
+
+        candidates = [
+            m.get("tradeMethodName"),
+            m.get("identifier"),
+            m.get("tradeMethodShortName"),
+            m.get("payType"),
+        ]
+        for c in candidates:
+            if c:
+                names.append(str(c))
+
+    return names
+
+
+def payment_matches(ad_payment_names: List[str], selected_payment: str, fiat: str) -> bool:
+    if selected_payment == "ANY":
+        return True
+
+    joined = " | ".join(normalize_text(x) for x in ad_payment_names)
+    keywords = PAYMENT_KEYWORDS.get(fiat, {}).get(selected_payment, [selected_payment.lower()])
+
+    for kw in keywords:
+        if normalize_text(kw) in joined:
+            return True
+
+    return False
 
 
 def fetch_ads(trade_type: str, pay_types: List[str], rows: int, page: int = 1) -> Dict[str, Any]:
     payload = {
         "page": page,
         "rows": rows,
-        "payTypes": pay_types,
+        # Специально отправляем [] и фильтруем локально, чтобы не пропускать похожие названия
+        "payTypes": [],
         "asset": ASSET,
         "fiat": current_fiat(),
         "tradeType": trade_type
@@ -209,6 +322,11 @@ def passes_filters(item: Dict[str, Any], amount_fiat: float) -> bool:
         return False
     if completion < MIN_COMPLETION_RATE:
         return False
+
+    method_names = get_trade_method_names(item)
+    if not payment_matches(method_names, pay_label(), current_fiat()):
+        return False
+
     return True
 
 
@@ -412,17 +530,21 @@ def fiat_buttons() -> Dict[str, Any]:
 
 
 def pay_buttons() -> Dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "SEPA", "callback_data": "PAY:SEPA"},
-                {"text": "Revolut", "callback_data": "PAY:Revolut"},
-                {"text": "Wise", "callback_data": "PAY:Wise"},
-                {"text": "ANY", "callback_data": "PAY:ANY"},
-            ],
-            [{"text": "🔄 Сброс", "callback_data": "MENU:RESET"}],
-        ]
-    }
+    options = current_pay_options()
+    btns: List[List[Dict[str, str]]] = []
+    row: List[Dict[str, str]] = []
+
+    for opt in options:
+        row.append({"text": opt, "callback_data": f"PAY:{opt}"})
+        if len(row) == 3:
+            btns.append(row)
+            row = []
+
+    if row:
+        btns.append(row)
+
+    btns.append([{"text": "🔄 Сброс", "callback_data": "MENU:RESET"}])
+    return {"inline_keyboard": btns}
 
 
 def range_buttons() -> Dict[str, Any]:
@@ -479,12 +601,16 @@ def help_text() -> str:
         "1) Выбери фиатную валюту кнопкой 💱\n"
         "2) Напиши баланс: balance 200\n"
         "3) Нажми «⚙️ Настроить» и пройди шаги\n"
-        "4) Нажми ▶️ Старт\n\n"
+        "4) Выбери оплату именно для этой валюты\n"
+        "5) Нажми ▶️ Старт\n\n"
         "Бот ищет:\n"
         f"• asset: {ASSET}\n"
         "• fiat: выбранная тобой валюта\n"
+        "• payType: способ оплаты для этой валюты\n"
         "• BUY → SELL внутри Binance P2P\n\n"
-        "Можно переключать валюты и искать там, где тебе удобно."
+        "Важно:\n"
+        "• Оплата проверяется и по кнопке, и по похожим названиям в объявлении\n"
+        "• При смене валюты старая оплата может сброситься"
     )
 
 
@@ -522,8 +648,9 @@ def wizard_start(chat_id: int):
         )
         return
 
+    ensure_pay_valid_for_fiat()
     STATE["wizard_step"] = 1
-    show_screen(chat_id, "Шаг 2/5 — выбери оплату 💳", pay_buttons())
+    show_screen(chat_id, f"Шаг 2/5 — выбери оплату 💳\nВалюта: {STATE['fiat']}", pay_buttons())
 
 
 def wizard_next(chat_id: int):
@@ -638,6 +765,8 @@ def scanner_loop():
                         s_tr, s_comp = get_adv_stats(s)
 
                         est_profit = profit_fiat(balance, spread)
+                        buy_methods = ", ".join(get_trade_method_names(b)[:5]) or "-"
+                        sell_methods = ", ".join(get_trade_method_names(s)[:5]) or "-"
 
                         signal = {
                             "fiat": fiat,
@@ -654,6 +783,8 @@ def scanner_loop():
                             "buy_completion": b_comp,
                             "sell_trades": s_tr,
                             "sell_completion": s_comp,
+                            "buy_methods": get_trade_method_names(b),
+                            "sell_methods": get_trade_method_names(s),
                         }
 
                         ai_note = ""
@@ -675,7 +806,9 @@ def scanner_loop():
                             f"Оплата: {pay_label()} | Диапазон: {spread_min:.1f}–{spread_max:.1f}% | Порог: {alert:.1f}%\n"
                             f"BUY лимиты : {b_adv.get('minSingleTransAmount')}..{b_adv.get('maxSingleTransAmount')} {fiat}\n"
                             f"SELL лимиты: {s_adv.get('minSingleTransAmount')}..{s_adv.get('maxSingleTransAmount')} {fiat}\n"
-                            f"BUY trades/comp: {b_tr}/{b_comp:.1f}% | SELL trades/comp: {s_tr}/{s_comp:.1f}%"
+                            f"BUY trades/comp: {b_tr}/{b_comp:.1f}% | SELL trades/comp: {s_tr}/{s_comp:.1f}%\n"
+                            f"BUY methods: {buy_methods}\n"
+                            f"SELL methods: {sell_methods}"
                             + ai_note
                         )
                         tg_send(chat_id, msg)
@@ -844,10 +977,23 @@ def handle_callback(chat_id: int, data: str):
             show_screen(chat_id, "Ошибка валюты.", kb_start())
             return
 
+        old_fiat = STATE["fiat"]
         STATE["fiat"] = val
         STATE["fiat_set"] = True
-        _msg = f"✅ Валюта: {val}\nТеперь введи баланс в {val}: balance 200"
-        show_screen(chat_id, _msg, kb_start())
+
+        if old_fiat != val:
+            ensure_pay_valid_for_fiat()
+
+        if STATE["balance_set"]:
+            msg = (
+                f"✅ Валюта установлена: {val}\n"
+                f"Баланс сейчас: {STATE['balance']:.2f} {val}\n"
+                "Теперь выбери оплату под эту валюту."
+            )
+        else:
+            msg = f"✅ Валюта: {val}\nТеперь введи баланс в {val}: balance 200"
+
+        show_screen(chat_id, msg, kb_start())
         return
 
     if data.startswith("PAY:"):
@@ -858,7 +1004,13 @@ def handle_callback(chat_id: int, data: str):
             show_screen(chat_id, f"Сначала введи баланс в {STATE['fiat']}: balance 200", kb_start())
             return
 
-        val = data.split(":", 1)[1]
+        val = normalize_pay_value(data.split(":", 1)[1])
+
+        allowed = set(current_pay_options())
+        if val not in allowed:
+            show_screen(chat_id, f"Этот метод оплаты не подходит для {STATE['fiat']}.", pay_buttons())
+            return
+
         STATE["pay_types"] = [] if val == "ANY" else [val]
         STATE["pay_set"] = True
 
@@ -921,8 +1073,10 @@ def handle_callback(chat_id: int, data: str):
         if not STATE["balance_set"]:
             show_screen(chat_id, f"Сначала введи баланс в {STATE['fiat']}: balance 200", kb_start())
             return
+
+        ensure_pay_valid_for_fiat()
         STATE["wizard_step"] = 1
-        show_screen(chat_id, "Шаг 2/5 — выбери оплату 💳", pay_buttons())
+        show_screen(chat_id, f"Шаг 2/5 — выбери оплату 💳\nВалюта: {STATE['fiat']}", pay_buttons())
         return
 
     if data == "MENU:RANGE":
